@@ -1,0 +1,16 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: breeze-lspd
+  namespace: microservice
+  labels:
+    app: breeze-lspd
+spec:
+  ports:
+    - protocol: TCP
+      port: 5051
+      targetPort: 5051
+  selector:
+    app: breeze-lspd
+  type: ClusterIP
+  sessionAffinity: None

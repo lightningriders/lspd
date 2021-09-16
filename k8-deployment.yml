@@ -1,0 +1,94 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: breeze-lspd
+  namespace: microservice
+  labels:
+    app: breeze-lspd
+  annotations:
+    deployment.kubernetes.io/revision: '17'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: breeze-lspd
+  template:
+    metadata:
+      labels:
+        app: breeze-lspd
+    spec:
+      containers:
+        - name: breeze-lspd
+          image: 'localhost:32000/breezlspd:v4'
+          ports:
+            - containerPort: 5051
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDRESS
+              value: '0.0.0.0:5051'
+            - name: LND_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: LND_CERT
+            - name: LND_ADDRESS
+              value: 'lnd-breez.lqwd-lnd:10009'
+            - name: LND_MACAROON_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: LND_MACAROON_HEX
+            - name: NODE_NAME
+              value: lqwd-lnd_lnd-breez
+            - name: NODE_PUBKEY
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: NODE_PUBKEY
+            - name: NODE_HOST
+              value: 'lnd-breez.lqwd-lnd:9735'
+            - name: TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: TOKEN
+            - name: LSPD_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: LSPD_PRIVATE_KEY
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: DATABASE_URL
+            - name: AWS_REGION
+              value: us-west-2
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: breeze-lspd-secret
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: OPENCHANNEL_NOTIFICATION_TO
+              value: '["Christian <christian@lqwd.money>"]'
+            - name: OPENCHANNEL_NOTIFICATION_CC
+              value: '["Albert <albert@lqwd.money>"]'
+            - name: OPENCHANNEL_NOTIFICATION_FROM
+              value: Info <info@lqwd.money>
+          resources:
+            limits:
+              memory: 2000Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          imagePullPolicy: Always
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+
