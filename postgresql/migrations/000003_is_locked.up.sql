@@ -1,0 +1,1 @@
+ALTER TABLE public.payments ADD is_locked boolean default false;

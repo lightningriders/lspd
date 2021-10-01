@@ -18,6 +18,15 @@ var (
 	pgxPool *pgxpool.Pool
 )
 
+type LndNode struct {
+	NodeName string
+	PubKey    string
+	Address    string
+	TlsCert string
+	Macaroon string
+	ID uint32
+}
+
 func pgConnect() error {
 	var err error
 	pgxPool, err = pgxpool.Connect(context.Background(), os.Getenv("DATABASE_URL"))
@@ -27,25 +36,29 @@ func pgConnect() error {
 	return nil
 }
 
-func paymentInfo(htlcPaymentHash []byte) ([]byte, []byte, []byte, int64, int64, []byte, uint32, error) {
+func paymentInfo(htlcPaymentHash []byte) ([]byte, []byte, []byte, int64, int64, []byte, uint32, bool, error) {
 	var (
 		paymentHash, paymentSecret, destination []byte
 		incomingAmountMsat, outgoingAmountMsat  int64
 		fundingTxID                             []byte
 		fundingTxOutnum                         pgtype.Int4
+		isLocked                                bool
 	)
+
 	err := pgxPool.QueryRow(context.Background(),
-		`SELECT payment_hash, payment_secret, destination, incoming_amount_msat, outgoing_amount_msat, funding_tx_id, funding_tx_outnum
+		`SELECT payment_hash, payment_secret, destination, incoming_amount_msat, outgoing_amount_msat, funding_tx_id, funding_tx_outnum, is_locked
 			FROM payments
 			WHERE payment_hash=$1 OR sha256('probing-01:' || payment_hash)=$1`,
-		htlcPaymentHash).Scan(&paymentHash, &paymentSecret, &destination, &incomingAmountMsat, &outgoingAmountMsat, &fundingTxID, &fundingTxOutnum)
+		htlcPaymentHash).Scan(&paymentHash, &paymentSecret, &destination, &incomingAmountMsat, &outgoingAmountMsat, &fundingTxID, &fundingTxOutnum, &isLocked)
+
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			err = nil
 		}
-		return nil, nil, nil, 0, 0, nil, 0, err
+		return nil, nil, nil, 0, 0, nil, 0,false, err
 	}
-	return paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, fundingTxID, uint32(fundingTxOutnum.Int), nil
+
+	return paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, fundingTxID, uint32(fundingTxOutnum.Int), isLocked, nil
 }
 
 func setFundingTx(paymentHash, fundingTxID []byte, fundingTxOutnum int) error {
@@ -55,6 +68,16 @@ func setFundingTx(paymentHash, fundingTxID []byte, fundingTxOutnum int) error {
 			WHERE payment_hash=$1`,
 		paymentHash, fundingTxID, fundingTxOutnum)
 	log.Printf("setFundingTx(%x, %x, %v): %s err: %v", paymentHash, fundingTxID, fundingTxOutnum, commandTag, err)
+	return err
+}
+
+func lockOrUnlockPayment(paymentHash []byte, lock bool) error {
+	commandTag, err := pgxPool.Exec(context.Background(),
+		`UPDATE payments
+			SET is_locked = $2
+			WHERE payment_hash=$1`,
+		paymentHash, lock)
+	log.Printf("lockOrUnlockPayment(%x, %t): %s err: %v", paymentHash, lock, commandTag, err)
 	return err
 }
 
@@ -86,6 +109,42 @@ func insertChannel(chanID uint64, channelPoint string, nodeID []byte, lastUpdate
 			chanID, channelPoint, nodeID, err)
 	}
 	return nil
+}
+
+func getAllNodes() (nodes []LndNode, err error) {
+	rows , err := pgxPool.Query(
+		context.Background(),
+		"SELECT * FROM lnd_node")
+
+	if err != nil {
+		return nil, fmt.Errorf("an error occurred when retrieving node, error: %w", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var lndNode LndNode
+		if err = rows.Scan(&lndNode.PubKey, &lndNode.TlsCert, &lndNode.NodeName, &lndNode.Address, &lndNode.Macaroon, &lndNode.ID); err != nil {
+			continue
+		}
+		nodes = append(nodes, lndNode)
+	}
+
+	return nodes, rows.Err()
+}
+
+func findLndNodeByPubKey(pubKey string) (nodes *LndNode, err error) {
+
+	var lndNode LndNode
+
+	err = pgxPool.QueryRow(
+		context.Background(),
+		"SELECT * FROM lnd_node WHERE pub_key = $1", pubKey).Scan(
+		&lndNode.PubKey, &lndNode.TlsCert, &lndNode.NodeName, &lndNode.Address, &lndNode.Macaroon, &lndNode.ID)
+
+
+
+	return &lndNode, err
 }
 
 func confirmedChannels(sNodeID string) (map[string]uint64, error) {

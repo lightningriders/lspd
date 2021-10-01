@@ -3,6 +3,8 @@ syntax = "proto3";
 option java_multiple_files = true;
 option java_package = "io.grpc.lspd.service";
 option java_outer_classname = "LspdProto";
+option go_package = "lspd/";
+
 
 package lspd;
 
@@ -59,6 +61,7 @@ message ChannelInformationReply {
 message OpenChannelRequest {
   /// The identity pubkey of the Lightning node
   string pubkey = 1 [ json_name = "pubkey" ];
+  string routing_node_pubkey = 2 [ json_name = "routingNodePubkey" ];
 }
 
 message OpenChannelReply {

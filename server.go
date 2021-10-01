@@ -6,17 +6,11 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
-	"log"
-	"net"
-	"os"
-	"strings"
-
 	lspdrpc "github.com/breez/lspd/rpc"
-	"github.com/golang/protobuf/proto"
-
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/caddyserver/certmagic"
+	"github.com/golang/protobuf/proto"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
@@ -28,6 +22,10 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"log"
+	"net"
+	"os"
+	"strings"
 )
 
 const (
@@ -43,24 +41,30 @@ const (
 	maxInactiveDuration       = 45 * 24 * 3600
 )
 
-type server struct{}
+type server struct{
+	lspdrpc.UnimplementedChannelOpenerServer
+}
 
 var (
-	client              lnrpc.LightningClient
-	routerClient        routerrpc.RouterClient
-	chainNotifierClient chainrpc.ChainNotifierClient
 	openChannelReqGroup singleflight.Group
 	privateKey          *btcec.PrivateKey
 	publicKey           *btcec.PublicKey
-	nodeName            = os.Getenv("NODE_NAME")
-	nodePubkey          = os.Getenv("NODE_PUBKEY")
+	clientsMap          map[string] lnrpc.LightningClient
+	routerClientMap     map[string] routerrpc.RouterClient
 )
 
-func (s *server) ChannelInformation(ctx context.Context, in *lspdrpc.ChannelInformationRequest) (*lspdrpc.ChannelInformationReply, error) {
+func (s *server) ChannelInformation(ctx context.Context, in *lspdrpc.ChannelInformationRequest) (*lspdrpc.ChannelInformationReply, error){
+
+	node, err := findLndNodeByPubKey(in.Pubkey)
+
+	if err != nil{
+		return nil, fmt.Errorf("failed to find node by pubkey: %s", in.Pubkey)
+	}
+
 	return &lspdrpc.ChannelInformationReply{
-		Name:                  nodeName,
-		Pubkey:                nodePubkey,
-		Host:                  os.Getenv("NODE_HOST"),
+		Name:                  node.NodeName,
+		Pubkey:                node.PubKey,
+		Host:                  node.Address,
 		ChannelCapacity:       publicChannelAmount,
 		TargetConf:            targetConf,
 		MinHtlcMsat:           minHtlcMsat,
@@ -102,20 +106,26 @@ func (s *server) RegisterPayment(ctx context.Context, in *lspdrpc.RegisterPaymen
 }
 
 func (s *server) OpenChannel(ctx context.Context, in *lspdrpc.OpenChannelRequest) (*lspdrpc.OpenChannelReply, error) {
+	node, err := findLndNodeByPubKey(in.RoutingNodePubkey)
+
+	if err != nil{
+		return nil, fmt.Errorf("failed to find node by pubkey: %w", in.RoutingNodePubkey)
+	}
+
 	r, err, _ := openChannelReqGroup.Do(in.Pubkey, func() (interface{}, error) {
-		clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-		nodeChannels, err := getNodeChannels(in.Pubkey)
+		clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", node.Macaroon)
+		nodeChannels, err := getNodeChannels(in.Pubkey, node)
 		if err != nil {
 			return nil, err
 		}
-		pendingChannels, err := getPendingNodeChannels(in.Pubkey)
+		pendingChannels, err := getPendingNodeChannels(in.Pubkey, node)
 		if err != nil {
 			return nil, err
 		}
 		var txidStr string
 		var outputIndex uint32
 		if len(nodeChannels) == 0 && len(pendingChannels) == 0 {
-			response, err := client.OpenChannelSync(clientCtx, &lnrpc.OpenChannelRequest{
+			response, err := clientsMap[node.NodeName].OpenChannelSync(clientCtx, &lnrpc.OpenChannelRequest{
 				LocalFundingAmount: publicChannelAmount,
 				NodePubkeyString:   in.Pubkey,
 				PushSat:            0,
@@ -264,8 +274,13 @@ func getClosedChannels(nodeID string, channelPoints map[string]uint64) (map[stri
 }
 
 func getWaitingCloseChannels(nodeID string) ([]*lnrpc.PendingChannelsResponse_WaitingCloseChannel, error) {
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-	pendingResponse, err := client.PendingChannels(clientCtx, &lnrpc.PendingChannelsRequest{})
+	node, err := findLndNodeByPubKey(nodeID)
+
+	if err != nil{
+		return nil, fmt.Errorf("failed to find node by pubkey: %s", nodeID)
+	}
+	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", node.Macaroon)
+	pendingResponse, err := clientsMap[node.NodeName].PendingChannels(clientCtx, &lnrpc.PendingChannelsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -278,9 +293,10 @@ func getWaitingCloseChannels(nodeID string) ([]*lnrpc.PendingChannelsResponse_Wa
 	return waitingCloseChannels, nil
 }
 
-func getNodeChannels(nodeID string) ([]*lnrpc.Channel, error) {
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-	listResponse, err := client.ListChannels(clientCtx, &lnrpc.ListChannelsRequest{})
+func getNodeChannels(nodeID string, routingNode *LndNode) ([]*lnrpc.Channel, error) {
+
+	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", routingNode.Macaroon)
+	listResponse, err := clientsMap[routingNode.NodeName].ListChannels(clientCtx, &lnrpc.ListChannelsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -293,9 +309,9 @@ func getNodeChannels(nodeID string) ([]*lnrpc.Channel, error) {
 	return nodeChannels, nil
 }
 
-func getPendingNodeChannels(nodeID string) ([]*lnrpc.PendingChannelsResponse_PendingOpenChannel, error) {
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-	pendingResponse, err := client.PendingChannels(clientCtx, &lnrpc.PendingChannelsRequest{})
+func getPendingNodeChannels(nodeID string, routingNode *LndNode) ([]*lnrpc.PendingChannelsResponse_PendingOpenChannel, error) {
+	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", routingNode.Macaroon)
+	pendingResponse, err := clientsMap[routingNode.NodeName].PendingChannels(clientCtx, &lnrpc.PendingChannelsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -349,39 +365,58 @@ func main() {
 		}
 	}
 
-	// Creds file to connect to LND gRPC
+	 nodes, err := getAllNodes()
+
+	 if err != nil {
+		 log.Fatalf("failed to retrieve nodes: %v", err)
+	 }
+
+	clientsMap = make(map[string]lnrpc.LightningClient)
+	routerClientMap = make(map[string]routerrpc.RouterClient)
+
 	cp := x509.NewCertPool()
-	if !cp.AppendCertsFromPEM([]byte(strings.Replace(os.Getenv("LND_CERT"), "\\n", "\n", -1))) {
-		log.Fatalf("credentials: failed to append certificates")
-	}
-	creds := credentials.NewClientTLSFromCert(cp, "")
 
-	// Address of an LND instance
-	conn, err := grpc.Dial(os.Getenv("LND_ADDRESS"), grpc.WithTransportCredentials(creds))
-	if err != nil {
-		log.Fatalf("Failed to connect to LND gRPC: %v", err)
-	}
-	defer conn.Close()
-	client = lnrpc.NewLightningClient(conn)
-	routerClient = routerrpc.NewRouterClient(conn)
-	chainNotifierClient = chainrpc.NewChainNotifierClient(conn)
+	 for _, node := range nodes{
 
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-	info, err := client.GetInfo(clientCtx, &lnrpc.GetInfoRequest{})
-	if err != nil {
-		log.Fatalf("client.GetInfo() error: %v", err)
-	}
-	if nodeName == "" {
-		nodeName = info.Alias
-	}
-	if nodePubkey == "" {
-		nodePubkey = info.IdentityPubkey
-	}
+		 if !cp.AppendCertsFromPEM([]byte(strings.Replace(node.TlsCert, "\\n", "\n", -1))) {
+		 	log.Print("credentials: failed to append certificates")
+		 	continue
+		 }
 
-	go intercept()
+		 creds := credentials.NewClientTLSFromCert(cp, "")
+		 conn, err := grpc.Dial(node.Address, grpc.WithTransportCredentials(creds))
 
-	go forwardingHistorySynchronize()
-	go channelsSynchronize(chainNotifierClient)
+		 client := lnrpc.NewLightningClient(conn)
+		 routerClient := routerrpc.NewRouterClient(conn)
+		 chainNotifierClient := chainrpc.NewChainNotifierClient(conn)
+
+		 if err != nil {
+			 	log.Printf("Failed to connect to Node: %v", err)
+			 	continue
+			 }
+
+		 clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", node.Macaroon)
+
+		 _, err = client.GetInfo(clientCtx, &lnrpc.GetInfoRequest{})
+
+		 if err != nil {
+			 log.Printf("Failed to connect to LND gRPC: %v", err)
+			 continue
+		 }
+
+		 go intercept(node.Macaroon, routerClient, client)
+		 go forwardingHistorySynchronize(clientCtx,client)
+		 go channelsSynchronize(node.Macaroon,chainNotifierClient,client)
+
+		 clientsMap[node.NodeName] = client
+		 routerClientMap[node.NodeName] = routerClient
+
+		 fmt.Printf("Name: %s Address: %s", node.NodeName, node.Address)
+	 }
+
+	 if len(clientsMap) == 0 {
+	 	log.Fatal("Oops LSPD can't start because no routing node was connected")
+	 }
 
 	s := grpc.NewServer(
 		grpc_middleware.WithUnaryServerChain(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
@@ -395,8 +430,12 @@ func main() {
 			return nil, status.Errorf(codes.PermissionDenied, "Not authorized")
 		}),
 	)
+
 	lspdrpc.RegisterChannelOpenerServer(s, &server{})
+
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
+
+	fmt.Println("LSPD started and running")
 }

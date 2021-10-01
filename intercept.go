@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"os"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec"
@@ -58,6 +57,7 @@ func openChannel(ctx context.Context, client lnrpc.LightningClient, paymentHash,
 	if capacity == publicChannelAmount {
 		capacity++
 	}
+
 	channelPoint, err := client.OpenChannelSync(ctx, &lnrpc.OpenChannelRequest{
 		NodePubkey:         destination,
 		LocalFundingAmount: capacity,
@@ -96,9 +96,9 @@ func getChannel(ctx context.Context, client lnrpc.LightningClient, node []byte, 
 	return 0
 }
 
-func intercept() {
+func intercept(macaroon string, routerClient routerrpc.RouterClient, lightningClient lnrpc.LightningClient) {
 
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
+	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", macaroon)
 	interceptorClient, err := routerClient.HtlcInterceptor(clientCtx)
 	if err != nil {
 		log.Fatalf("routerClient.HtlcInterceptor(): %v", err)
@@ -128,28 +128,38 @@ func intercept() {
 			request.OnionBlob,
 		)
 
-		paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, fundingTxID, fundingTxOutnum, err := paymentInfo(request.PaymentHash)
+		paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, fundingTxID, fundingTxOutnum, _, err := paymentInfo(request.PaymentHash)
+
 		if err != nil {
 			log.Printf("paymentInfo(%x) error: %v", request.PaymentHash, err)
 		}
+
+		//if isLocked{
+		//	log.Printf("Payment is being acted upon by another node")
+		//	continue
+		//}
+
+		//lockOrUnlockPayment(paymentHash, true)
+
 		log.Printf("paymentHash:%x\npaymentSecret:%x\ndestination:%x\nincomingAmountMsat:%v\noutgoingAmountMsat:%v\n\n",
 			paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat)
 		if paymentSecret != nil {
 
 			if fundingTxID == nil {
 				if bytes.Compare(paymentHash, request.PaymentHash) == 0 {
-					fundingTxID, fundingTxOutnum, err = openChannel(clientCtx, client, request.PaymentHash, destination, incomingAmountMsat)
+					fundingTxID, fundingTxOutnum, err = openChannel(clientCtx, lightningClient, request.PaymentHash, destination, incomingAmountMsat)
 					log.Printf("openChannel(%x, %v) err: %v", destination, incomingAmountMsat, err)
 					if err != nil {
 						interceptorClient.Send(&routerrpc.ForwardHtlcInterceptResponse{
 							IncomingCircuitKey: request.IncomingCircuitKey,
 							Action:             routerrpc.ResolveHoldForwardAction_FAIL,
 						})
+						lockOrUnlockPayment(paymentHash, false)
 						continue
 					}
 				} else { //probing
 					failureCode := routerrpc.ForwardHtlcInterceptResponse_TEMPORARY_CHANNEL_FAILURE
-					if err := isConnected(clientCtx, client, destination); err == nil {
+					if err := isConnected(clientCtx, lightningClient, destination); err == nil {
 						failureCode = routerrpc.ForwardHtlcInterceptResponse_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 					}
 					interceptorClient.Send(&routerrpc.ForwardHtlcInterceptResponse{
@@ -157,6 +167,7 @@ func intercept() {
 						Action:             routerrpc.ResolveHoldForwardAction_FAIL,
 						FailureCode:        failureCode,
 					})
+					lockOrUnlockPayment(paymentHash, false)
 					continue
 				}
 			}
@@ -168,6 +179,7 @@ func intercept() {
 			log.Printf("btcec.NewPrivateKey(): %v", err)
 
 			var bigProd, bigAmt big.Int
+			//amt = (outgoingAmountMsat * request.OutgoingAmountMsat) / incomingAmountMsat
 			amt := (bigAmt.Div(bigProd.Mul(big.NewInt(outgoingAmountMsat), big.NewInt(int64(request.OutgoingAmountMsat))), big.NewInt(incomingAmountMsat))).Int64()
 
 			var addr [32]byte
@@ -206,12 +218,13 @@ func intercept() {
 					IncomingCircuitKey: request.IncomingCircuitKey,
 					Action:             routerrpc.ResolveHoldForwardAction_FAIL,
 				})
+				lockOrUnlockPayment(paymentHash, false)
 				continue
 			}
 			channelPoint := wire.NewOutPoint(&h, fundingTxOutnum).String()
 			go resumeOrCancel(
 				clientCtx, interceptorClient, request.IncomingCircuitKey, destination,
-				channelPoint, uint64(amt), onionBlob.Bytes(),
+				channelPoint, uint64(amt), onionBlob.Bytes(),lightningClient,
 			)
 
 		} else {
@@ -223,6 +236,7 @@ func intercept() {
 				OnionBlob:               request.OnionBlob,
 			})
 		}
+		lockOrUnlockPayment(paymentHash, false)
 	}
 }
 
@@ -234,10 +248,11 @@ func resumeOrCancel(
 	channelPoint string,
 	outgoingAmountMsat uint64,
 	onionBlob []byte,
+	lightningClient lnrpc.LightningClient,
 ) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		chanID := getChannel(ctx, client, destination, channelPoint)
+		chanID := getChannel(ctx, lightningClient, destination, channelPoint)
 		if chanID != 0 {
 			interceptorClient.Send(&routerrpc.ForwardHtlcInterceptResponse{
 				IncomingCircuitKey:      incomingCircuitKey,
