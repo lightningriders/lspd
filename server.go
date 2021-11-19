@@ -112,6 +112,8 @@ func (s *server) OpenChannel(ctx context.Context, in *lspdrpc.OpenChannelRequest
 		return nil, fmt.Errorf("failed to find node by pubkey: %w", in.RoutingNodePubkey)
 	}
 
+	println(node.NodeName)
+
 	r, err, _ := openChannelReqGroup.Do(in.Pubkey, func() (interface{}, error) {
 		clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", node.Macaroon)
 		nodeChannels, err := getNodeChannels(in.Pubkey, node)
@@ -295,8 +297,13 @@ func getWaitingCloseChannels(nodeID string) ([]*lnrpc.PendingChannelsResponse_Wa
 
 func getNodeChannels(nodeID string, routingNode *LndNode) ([]*lnrpc.Channel, error) {
 
+	if clientsMap[routingNode.NodeName] == nil{
+		println("cleint is nil")
+	}
 	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", routingNode.Macaroon)
-	listResponse, err := clientsMap[routingNode.NodeName].ListChannels(clientCtx, &lnrpc.ListChannelsRequest{})
+	listResponse, err := clientsMap[routingNode.NodeName].ListChannels(clientCtx, &lnrpc.ListChannelsRequest{
+		ActiveOnly: true,
+	})
 	if err != nil {
 		return nil, err
 	}
